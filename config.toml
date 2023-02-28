@@ -1,0 +1,10 @@
+# config file
+remote_server = "example.com:8022"
+tunnels =[
+"-R 9999:127.0.0.1:5900", #tun_type [adr]:port:adr:port
+"R 2222:127.0.0.1:2222", #"R" instead "-R" also correct
+]
+[logger]
+human = false
+level = "info"
+outfile = "log.txt"

@@ -5,20 +5,29 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"time"
 
+	"github.com/lodmev/go/log"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
+func getHomePath() string {
+	if runtime.GOOS == "windows" {
+		return os.Getenv("HOMEDRIVE") + os.Getenv("HOMEPATH")
+	} else {
+		return os.Getenv("HOME")
+	}
+}
 func sshConfigPath(filename string) string {
-	return filepath.Join(os.Getenv("HOMEDRIVE"), os.Getenv("HOMEPATH"), ".ssh", filename)
+	return filepath.Join(getHomePath(), ".ssh", filename)
 }
 
 func createSshConfig(username, keyFile string) *ssh.ClientConfig {
@@ -26,7 +35,6 @@ func createSshConfig(username, keyFile string) *ssh.ClientConfig {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	key, err := os.ReadFile(sshConfigPath(keyFile))
 	if err != nil {
 		log.Fatalf("unable to read private key: %v", err)
@@ -52,50 +60,111 @@ func createSshConfig(username, keyFile string) *ssh.ClientConfig {
 		HostKeyAlgorithms: []string{ssh.KeyAlgoECDSA256, ssh.KeyAlgoED25519},
 	}
 }
-
-func main() {
-	addr := "lodmev.duckdns.org:8022"
-	username := flag.String("user", "", "username for ssh")
-	keyFile := flag.String("keyfile", "", "file with private key for SSH authentication")
-	remotePort := flag.String("rport", "", "remote port for tunnel")
-	localPort := flag.String("lport", "", "local port for tunnel")
-	flag.Parse()
-
-	config := createSshConfig(*username, *keyFile)
-
-	client, err := ssh.Dial("tcp", addr, config)
-	if err != nil {
-		log.Fatal("Failed to dial: ", err)
+func getSSHConnection(addr *string, config *ssh.ClientConfig) (client *ssh.Client) {
+	var (
+		sshConnErr error
+	)
+	client, sshConnErr = ssh.Dial("tcp", *addr, config)
+	if sshConnErr != nil {
+		log.Errf("can't connect to SSH '%s' : %v. Will try reconnect", *addr, sshConnErr)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			client, sshConnErr = ssh.Dial("tcp", *addr, config)
+			if sshConnErr != nil {
+				log.Printf("error while connecting to ssh: %v", sshConnErr)
+			} else {
+				return
+			}
+			log.Trace().Msg("reconnecting ssh...")
+		}
 	}
-	defer client.Close()
-
-	listener, err := client.Listen("tcp", "127.0.0.1:"+*remotePort)
+	return
+}
+func getListener(listFunc func(string, string) (net.Listener, error),
+	listenAddr *string) (listener net.Listener, fatalErr error) {
+	var err error
+	listener, err = listFunc("tcp", *listenAddr)
 	if err != nil {
-		log.Fatalf("unable to listen on remove: %v", err)
+		log.Trace().Msgf("can't listen '%s' will try again", *listenAddr)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			listener, err = listFunc("tcp", *listenAddr)
+			if err != nil {
+				if err.Error() == "EOF" {
+					fatalErr = err
+					return
+				}
+				switch err.(type) {
+				case *net.OpError:
+					fatalErr = err
+					return
+				default:
+					log.Trace().Msgf("can't listen adress '%s': %v ", *listenAddr, err)
+				}
+
+			} else {
+				return
+			}
+			log.Trace().Msg("trying to reopen listener")
+		}
+
+	}
+	return
+}
+func makeTunnel(sshClient *ssh.Client, tun Tunnel, wg *sync.WaitGroup, sshErr chan error) {
+	defer wg.Done()
+	dialAdress := tun.addres[tun.tunnelType.opposite()]
+	listenAdress := tun.addres[tun.tunnelType]
+	var listenFunc func(string, string) (net.Listener, error)
+	var dialFunc func(string, string) (net.Conn, error)
+	var tunStr string
+	switch tun.tunnelType {
+	case Local:
+		listenFunc = net.Listen
+		dialFunc = sshClient.Dial
+		tunStr = fmt.Sprintf("from 'local:%s' to 'remote:%s'", listenAdress, dialAdress)
+	case Remote:
+		listenFunc = sshClient.Listen
+		dialFunc = net.Dial
+		tunStr = fmt.Sprintf("from 'remote:%s' to 'local:%s'", listenAdress, dialAdress)
+	}
+	log.Debug().Msgf("Esteblishing tunnel %s", tunStr)
+	defer log.Printf("Canceling tunnel %s", tunStr)
+	listener, err := getListener(listenFunc, &listenAdress)
+	// getListener returning only critical error
+	if err != nil {
+		log.Trace().Msgf("listen adress fail, tunnel %s will be closed", tunStr)
+		return
 	}
 	defer listener.Close()
-	done := make(chan struct{}, 1)
-
-	go func() {
-		for {
-			local, err := net.Dial("tcp", "localhost:"+*localPort)
+Loop:
+	for {
+		select {
+		case <-sshErr:
+			log.Trace().Msgf("ssh has problems closing tunnel %s", tunStr)
+			break Loop
+		default:
+			listenConn, err := listener.Accept()
 			if err != nil {
-				log.Fatalf("unable to dial local: %v", err)
+				log.Trace().Msgf("can't accept listen conn: %v", err)
+				break Loop
 			}
-			remote, err := listener.Accept()
+			dialConn, err := dialFunc("tcp", dialAdress)
 			if err != nil {
-				log.Fatal(err)
+				log.Trace().Msgf("unable to dial %v", err)
+				listenConn.Close()
+				continue
 			}
-
-			fmt.Println("tunnel established with", local.LocalAddr())
-			runTunnel(local, remote)
-			fmt.Println("tunnel closed with", local.LocalAddr())
+			go handleConn(dialConn, listenConn)
 		}
-	}()
-	<-done
+	}
+	log.Trace().Msgf("exiting from tunnel %s", tunStr)
+
 }
 
-func runTunnel(local, remote net.Conn) {
+func handleConn(local, remote net.Conn) {
 	defer remote.Close()
 	defer local.Close()
 	done := make(chan struct{}, 2)
@@ -109,6 +178,38 @@ func runTunnel(local, remote net.Conn) {
 		io.Copy(remote, local)
 		done <- struct{}{}
 	}()
-
 	<-done
+}
+
+func main() {
+	setup()
+	log.Info().Msg("Starting service...")
+	handlersCount := len(tunnels)
+	var wg sync.WaitGroup
+	for {
+		sshConfig := createSshConfig(*username, *keyFile)
+		sshClient := getSSHConnection(remoteServer, sshConfig)
+		log.Info().Msgf("SSH connection to '%s' established", *remoteServer)
+		sshConnError := make(chan error, handlersCount)
+		defer sshClient.Close()
+		go func(connError chan error) {
+			err := sshClient.Conn.Wait()
+			log.Error().Err(fmt.Errorf("SSH connection lost, will try reconnect")).Send()
+			for _, tun := range tunnels {
+				connError <- err
+				if tun.tunnelType == Local {
+					//dialing local for accept listener and unblock loop
+					net.Dial("tcp", tun.addres[Local])
+				}
+			}
+		}(sshConnError)
+		for _, tun := range tunnels {
+			wg.Add(1)
+			go makeTunnel(sshClient, tun, &wg, sshConnError)
+		}
+		wg.Wait()
+		sshClient.Close()
+		close(sshConnError)
+		log.Trace().Msg("all tunnels closed")
+	}
 }
