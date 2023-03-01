@@ -66,7 +66,7 @@ func getSSHConnection(addr *string, config *ssh.ClientConfig) (client *ssh.Clien
 	)
 	client, sshConnErr = ssh.Dial("tcp", *addr, config)
 	if sshConnErr != nil {
-		log.Errf("can't connect to SSH '%s' : %v. Will try reconnect", *addr, sshConnErr)
+		log.Errf("can't connect to SSH '%s' : %v.", *addr, sshConnErr).Msg("Will try reconnect")
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {

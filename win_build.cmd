@@ -1,2 +1,2 @@
 @echo off
-go build -ldflags=-H windowsgui
+go build -ldflags="-H windowsgui"
